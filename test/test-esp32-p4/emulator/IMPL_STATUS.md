@@ -6,7 +6,8 @@
 ✅ **CI auto-trigger** `b5d2fd732d` — `feat/**` dispara build-libqemu.
 ✅ **Build + Phase 0 smoke** — machine init corre, CPU ejecuta.
 ✅ **UART0 + `-bios` loader** `24e67a8852` — `Hi\n` end-to-end desde firmware RISC-V hand-rolled, confirmado en stdout.
-✅ **Named peripheral stubs** `c976734cc2` — 22 peripherals (TIMG0/1, I²C×2, GP-SPI×2, USB Serial/JTAG, LEDC, Intmtx, ADC, GPIO/IO MUX, SYSTIMER, HP/LP SYSREG, PMU, LP_WDT, LP_UART, LP eFuse, etc.) registrados con `create_unimplemented_device()`. Visibles en `info mtree`, logging por peripheral, sin faults en accesos.
+✅ **Named peripheral stubs** `c976734cc2` — 22 peripherals registrados con `create_unimplemented_device()`. Visibles en `info mtree`, logging por peripheral, sin faults.
+✅ **Real eFuse + SYSTIMER + GPIO** `b9abf3712a` — 3 sysbus devices reales (~458 LOC) reemplazan los stubs correspondientes. Smoke test de 138 instrucciones RV32I valida que: MAC se lee como `0xDEADBE7C`, SYSTIMER avanza entre lecturas, GPIO bit 2 se setea/limpia con W1TS/W1TC y emite log "pin 2 -> 0/1".
 
 ## Build + smoke tests (verificados 2026-05-06)
 
@@ -48,6 +49,25 @@ Hi
 ```
 
 Pipeline validado: instrucción RISC-V → SW al MMIO UART0 (0x500CA000) → chardev backend → stdout host.
+
+### Phase 1.C — eFuse + SYSTIMER + GPIO reales
+
+138 instrucciones RV32I que: leen MAC del eFuse y dump nibble por nibble, leen SYSTIMER VAL_LO dos veces y comparan con SLTU, togglean GPIO 2 vía W1TS/W1TC, escriben "DONE" al UART.
+
+```
+$ qemu-system-riscv32 -M esp32p4 -bios full_test.bin -nographic
+[esp32p4] loaded 552 bytes of BIOS '/tmp/full_test.bin' at 0x4fc00000
+M==>:=;>7<                            ← MAC = 0xDEADBE7C, como configuramos en eFuse
+T=O                                   ← SYSTIMER avanzó: 'N' + (sltu==1) = 'O'
+G1[esp32p4.gpio] pin 2 -> 1            ← W1TS, log line del GPIO real
+G0[esp32p4.gpio] pin 2 -> 0            ← W1TC
+DONE
+```
+
+Implementations:
+- `hw/nvram/esp32p4_efuse.c` (95 LOC): MAC fijo 0xDEADBE7C / 0x0000A1DF, resto cero.
+- `hw/timer/esp32p4_systimer.c` (105 LOC): contador 16 MHz desde `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`. Snapshot HI→LO consistente.
+- `hw/gpio/esp32p4_gpio.c` (110 LOC): tracking GPIO_OUT pins 0-31, W1TS/W1TC, qemu_irq por pin para bridge futuro a Velxio + log per-pin.
 
 ### Phase 1.B — Stubs absorben sin faultear
 
