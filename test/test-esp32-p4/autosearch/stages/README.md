@@ -22,8 +22,9 @@ Tablero de estado: **una fila por fase**, ordenadas. Lo que viene primero es lo 
 | 2.D | CLIC backing-RAM + Cache freeze mirrors → **ROM reaches bootloader** | ✅ done | `3a1e6ed` | [phase_2d_clic_cache.md](phase_2d_clic_cache.md) |
 | 2.A.5 | `ets_loader_map_range` patch + flash blob reload → **ROM jumps to bootloader entry** | ✅ done | (this commit) | [phase_2a5_bootloader_load.md](phase_2a5_bootloader_load.md) |
 | 2.B.regi2c | LPPERI clock-enable + regi2c done bit → **bootloader runs 6.4s of init** | ✅ done | (this commit) | [phase_2b_regi2c.md](phase_2b_regi2c.md) |
-| 2.B.boot_comm | Cache MMU block 63 emulator → **chip ID check passes!** | ✅ done | (this commit) | [phase_2b_boot_comm.md](phase_2b_boot_comm.md) |
-| **2.B.post_qio** | **Bootloader stalls after qio_mode warning** — needs more polling overrides | ⏭️ **next** | — | TBD |
+| 2.B.boot_comm | Cache MMU block 63 emulator → **chip ID check passes!** | ✅ done | `64e2cd2` | [phase_2b_boot_comm.md](phase_2b_boot_comm.md) |
+| 2.B.post_qio (perf) | MMU refactor to eager-copy → **5x faster boot progress** | ✅ done | `947fba8` | [phase_2b_post_qio.md](phase_2b_post_qio.md) |
+| **2.I.sha** | **HW SHA256 accelerator → unblock bootloader software SHA** | ⏭️ **next** | — | TBD |
 | 2.B | TIMG real (timers + WDT) | ⏳ pending | — | (see roadmap) |
 | 2.C | HP_SYSREG + Reset/Clock real | ⏳ pending | — | (see roadmap) |
 | 2.D | CLIC + Interrupt Matrix | ⏳ pending | — | (see roadmap) |

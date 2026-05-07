@@ -6,7 +6,7 @@ cd /root
   -drive file=/root/blink.merged.bin,if=mtd,format=raw \
   -nographic > /root/qlong60.log 2>&1 &
 QPID=$!
-sleep 60
+sleep 120
 kill -15 $QPID 2>/dev/null
 wait 2>/dev/null
 

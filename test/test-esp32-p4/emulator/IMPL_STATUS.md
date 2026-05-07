@@ -57,6 +57,12 @@
     - **Mirror del flash blob** en buffer separado de 64 MB para que el MMU lookup pueda servir reads.
   - **Bug histórico**: asumí inicialmente VALID bit = bit 14 (0x4000) por convención antigua de ESP. ESP32-P4 lo movió a bit 12 (0x1000). Encontrado al observar `entries[1023] = 0x00001000` en runtime — el valor incluye `SOC_MMU_FLASH_VALID | SOC_MMU_ACCESS_FLASH = 0x1000` en lugar de un bit más alto.
   - Resultado: `mismatch chip ID` desaparece. Bootloader continúa cargando segments del app. Llega a un warning de qio_mode (no-fatal — usa DIO). Después del warning, corre 39+ segundos sin más print. Probablemente atascado en otro polling loop. Phase 2.B.post_qio investiga.
+🔧 **Phase 2.B.post_qio (perf)** `947fba8b80` — **Refactor MMU a eager-copy**.
+  - Trace de PCs muestra que post-qio, el bootloader está ejecutando código real (no en polling loop). Hot PCs son 0x4ff2de64 (XOR loop, SHA256 software), 0x4ff2d51c, 0x4ff2e1a2 (bootloader functions).
+  - El bottleneck era que cada read del cache window (durante SHA256 software) iba a través del MMIO overlay → ~100x slower que RAM directo.
+  - **Refactor**: en cada MMU entry write con VALID set, **inmediatamente memcpy** flash_blob[phys_page << 16..phys_page << 16 + 64K] → extflash_RAM[entry_idx << 16 + 0x40000000..]. Después de la copia, los reads van a RAM y TCG puede JIT-cachear.
+  - **Generalización**: removí el límite "solo block 63"; ahora cualquier entry (0..1023) se traduce eagerly. Soporta también XIP-from-cache de app code.
+  - Resultado: bootloader avanza ~47 sec fake time / 60 sec wall (vs ~10 sec/60 sec antes). Mejora ~5x. Aún slow porque está haciendo SHA256 software de toda la app image. Phase 2.I (HW SHA accelerator) o paciencia destrabarán.
 ✅ **Phase 1.E — 4 unblocks consecutivos** `b0c4aad8f5`:
   - **SP init en el trampolín**: `sp` partía en 0, primera push escribía a `0xFFFFFFFC` → store fault. Trampolín ahora setea `sp = 0x4FF80000` (~256 KB dentro de L2MEM).
   - **Custom CSRs + CLIC standard como scratch RW**: 0x7C0-0x7FF + 0x307 (mtvt) + 0x345-0x349 (mnxti family) + 0xFB1 (mintstatus). El runtime IDF setea CLIC vectoring temprano y exige que esos CSRs acepten writes.
