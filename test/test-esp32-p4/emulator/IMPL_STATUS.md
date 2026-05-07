@@ -26,6 +26,12 @@
   - Trace muestra `uart_hal_write_fifo` + `uart_hal_get_txfifo_count` ejecutando — **UART real escribe a stdout**.
   - Output garbled "EGGGGGGGG..." = principio del banner "Guru Meditation Error" del ROM panic handler. ROM cae en panic recursivo (probablemente eFuse read), pero **UART output works**.
 ✅ **Phase 2.A.3** `780ad0c50c` — **¡Banner completo del ROM!** `ESP-ROM:esp32p4-20230811 / Build:Aug 11 2023 / rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)`. Tres fixes: BIOS section-data pass (15 secciones `.data.*` no-PT_LOAD), reset-cause override (`0x50111010 → 0x80`), GPIO strap (offset 0x38 → 0x08). USB Serial tx patch para forzar output solo via UART0. ROM aún panica downstream (PC `0x4FC02954`, A5=0x8067) — algo overwrites `ets_ops_table_ptr` al runtime; Phase 2.A.4 investiga.
+✅ **Phase 2.A.4** — **ROM avanza más allá del banner sin panic**.
+  - Investigación: el ROM `_init` (`0x4FC00BDE`) tiene `unpackloop` (lee de `0x4FC1Cxxx` → `0x4FF3FFxx`) seguido de `clearloop` (zerea las mismas direcciones). Las dos tablas se sobreponen en `0x4FF3FFD8/E8/F4`.
+  - El descubrimiento clave: **el "agujero" entre PT_LOADs** — el ELF tiene LOAD entries con `FileSiz=0` para `0x4FC1C154+`, así que las fuentes de copia del unpack no están en el archivo. En silicon real la mask layer pre-graba esos bytes; en QEMU son 0s.
+  - Resultado en QEMU: section-data pass escribe `0x4FC1F984`, `0x4FC1D0F0`, etc. → unpackloop copia 0s sobre ellos → clearloop confirma 0s. Net: 0s en runtime. Por eso `lw a5, 0(a5)` faulteaba con A5=0 (que QEMU rendereaba como `0x8067` por algún coincidence de stack).
+  - **Fix**: ROM patch en `0x4FC00BE0`. Reemplaza `bne a0, t0, .data_bss_ok` (`0x06551063`) con `j .data_bss_ok` (`0x0600006F`). Skipea ambos loops para todos los harts. Section-data pass values quedan intactos.
+  - Resultado: ROM imprime banner, sigue ejecutando hasta tocar el CLIC interrupt controller (`hp_clic_mmio` writes a offsets `0x0000`, `0x1055-0x1057`). Próximo blocker: Phase 2.D (CLIC + Interrupt Matrix). 🎉
 ✅ **Phase 1.E — 4 unblocks consecutivos** `b0c4aad8f5`:
   - **SP init en el trampolín**: `sp` partía en 0, primera push escribía a `0xFFFFFFFC` → store fault. Trampolín ahora setea `sp = 0x4FF80000` (~256 KB dentro de L2MEM).
   - **Custom CSRs + CLIC standard como scratch RW**: 0x7C0-0x7FF + 0x307 (mtvt) + 0x345-0x349 (mnxti family) + 0xFB1 (mintstatus). El runtime IDF setea CLIC vectoring temprano y exige que esos CSRs acepten writes.
