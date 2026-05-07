@@ -1,72 +1,85 @@
-# Phase 2.A.5 — Flash bootloader load (invalid header)
+# Phase 2.A.5 — Flash bootloader load
 
-**Estado**: ⏭️ next · necesita cache MMU real
+**Estado**: ✅ done · commit pendiente
 
-## Goal
+## Resolución (resumen ejecutivo)
 
-ROM ahora ejecuta `ets_run_flash_bootloader` y trata de leer el header del bootloader desde el cache window. Imprime `invalid header: 0x0b000ec1` repetidamente.
+**Causa raíz dual**:
+1. El ROM ELF tiene un PT_LOAD a virtual `0x40000000` (~35 KB de constantes ROM) que **sobrescribe el flash blob** previamente cargado en el cache window. Resultado: ROM lee bytes de constantes ROM (`0xC1 0x0E 0x00 0x0B`) en vez del bootloader magic (`0xE9`).
+2. `ets_loader_map_range` en el ROM espera que el cache MMU esté programado. Sin un MMU real, devuelve garbage. Aunque arregláramos #1, el ROM seguiría leyendo de un VA equivocado.
 
-## Análisis
+**Fixes aplicados**:
 
-- Flash blob `blink.merged.bin` tiene `0xFF` en offset 0..0x1FFF (erased) y bootloader magic `0xE9` en offset `0x2000`.
-- ROM lee primer header desde `cache_window @ 0x40000000` que mapea a flash offset 0.
-- `0x0b000ec1` es lo que la cache devuelve al leer flash en offset 0 (probablemente algún garbage uninitialized o un read across boundary).
+### Fix 1 — Flash blob reload over cache window
 
-## Análisis del flujo (confirmado por disasm)
+Después de `load_elf_ram_sym` del BIOS ELF y la section-data pass, el flash blob se **reescribe** sobre el cache window via `blk_pread`. El orden ahora es:
+1. extflash region creada.
+2. Flash blob load inicial (línea ~582).
+3. BIOS ELF load (overwrites cache window con ROM constants).
+4. Section-data pass (escribe `.data.interface.*` en `0x4FF3FFxx`).
+5. ROM patches.
+6. **Flash blob reload** (recover cache window con flash content).
 
-`ets_run_flash_bootloader @ 0x4FC04762`:
-1. Llama `ROM_Boot_Cache_Init` que ejecuta `Cache_FLASH_MMU_Init`. Este invalida los 1024 entries del MMU (escribe 0 a `0x5008C37C` con index 0..1023 vía `0x5008C380`).
-2. Llama `ets_loader_map_range(buffer=sp+4, offset=0x2000, size=24, secure=0)`. Esta función debe:
-   - Programar el MMU para mapear flash[0x2000, 0x2000+24) a una virtual address en cache window.
-   - Devolver esa virtual address.
-3. Caller hace `memcpy(sp+12, mapped_va, 8)` y verifica `*(uint8_t*)mapped_va == 0xE9` (magic).
+```c
+DriveInfo *reload_dinfo = drive_get(IF_MTD, 0, 0);
+if (reload_dinfo) {
+    BlockBackend *reload_blk = blk_by_legacy_dinfo(reload_dinfo);
+    /* ... look up flash MR by base address ... */
+    blk_pread(reload_blk, 0, copy_size, host_ptr, 0);
+}
+```
 
-## Causa raíz
+### Fix 2 — `ets_loader_map_range` linear identity patch
 
-El MMU del flash cache está modelado como **smart stub scratch RW** (sólo guarda lo escrito, sin lógica). Las escrituras a `0x5008C37C/380` quedan en el storage pero **el cache window en `0x40000000` no responde a esas configuraciones**. En el setup actual de QEMU:
-- El flash blob de `blink.merged.bin` se carga directo a RAM en `0x40000000` (linear: flash byte 0 → 0x40000000, flash byte 0x2000 → 0x40002000).
-- `ets_loader_map_range` programa el MMU pero la translación no se ejecuta.
-- Si la función devuelve un VA que asume un mapping específico (no linear), el `memcpy` lee de un VA que no está mapeado a flash[0x2000].
+ROM patch (3 entries, 12 bytes total) en `0x4FC044CC`:
+```asm
+lui  a0, 0x40000   ; 0x40000537
+add  a0, a0, a1    ; 0x00B50533
+ret                ; 0x00008067
+```
 
-`0x0b000ec1` no aparece en la flash blob a ningún offset; probablemente es **stack garbage** que ets_loader_map_range devolvió cuando el MMU set falló.
+Bypassea param validation + MMU programming. Devuelve `0x40000000 + flash_offset` directly. Funciona para todos los call sites en `ets_run_flash_bootloader` (offsets 0x2000, 0x10000, etc.).
 
-## Plan de implementación
+## Resultado
 
-Phase 2.A.5 requiere un **cache MMU emulator real**:
+```
+ESP-ROM:esp32p4-20230811
+Build:Aug 11 2023
+rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x1174
+load:0x4ff29ed0,len:0xccc
+load:0x4ff2cbd0,len:0x34fc
+SHA-256 comparison failed:
+Calculated: 0000000000000000000000000000000000000000000000000000000000000000
+Expected: 55df7066fffde52c0ac426d1ca50a882ae5cd6f1cf2cb5d6dfccb1bf40ad58be
+Attempting to boot anyway...
+entry 0x4ff29ed0
+Assert failed in regi2c_enable_block, esp_rom_regi2c_esp32p4.c:90
+```
 
-1. **NO** cargar el flash blob directo a RAM en `0x40000000`. Cargar el blob a un MemoryRegion separado (RAM-backed) que solo es accesible vía el MMU.
-2. Implementar el cache window (`0x40000000-0x40FFFFFF`) como **MMIO region** que en cada read:
-   - Calcula `page_index = (vaddr - 0x40000000) >> 16` (64KB pages).
-   - Lee el MMU entry para `page_index`.
-   - Si entry es válido (bit 14 set per TRM): `flash_page = entry & 0x3FFF`.
-   - Devuelve `flash_blob[flash_page * 0x10000 + (vaddr & 0xFFFF)]`.
-3. Decodificar las escrituras a `0x5008C37C` (entry value) y `0x5008C380` (entry index) en una tabla `mmu_entries[1024]`.
-4. Cuando `Cache_FLASH_MMU_Init` invalida todo, todas las entries quedan en 0 (invalid). Antes de usar el cache, ROM debe llamar `Cache_FLASH_MMU_Set` que programa la mapping.
+ROM imprimió todo el flujo de boot:
+- ✓ Boot banner
+- ✓ SPI mode/clock info
+- ✓ 3 bootloader segments cargados a L2MEM
+- ✓ SHA-256 hash check (falló pero ROM continuó porque no hay secure boot)
+- ✓ Jump al bootloader entry point (`0x4ff29ed0`)
+- ✓ **Bootloader Espressif comenzó a ejecutarse**
+- ✗ Bootloader assert en `regi2c_enable_block` → Phase 2.B.regi2c
 
-### Referencia TRM
+## Acceptance criteria — pasaron
 
-- TRM Cap 7.3.3 "External Memory" — Cache MMU.
-- IDF `cache_ll.h` `cache_ll_l1_set_mmu_invalid_entry`.
-- esp-rom-elfs `Cache_MSPI_MMU_Set` source.
-
-## Acceptance criteria
-
-- [ ] ROM imprime `bootloader header valid` o equivalent → continúa booteando.
-- [ ] No más `invalid header` repeated.
-
-## Pasos
-
-1. Disassembly de `ets_run_flash_bootloader` y `0x4fc0e716` (la función que lee el header).
-2. Determinar offset que ROM espera.
-3. Si el blob está mal: regenerar O patchear cache window para mapear correctly.
-4. Validar fix con run.
-
-## Archivos a tocar
-
-- `hw/riscv/esp32p4.c` — posible cache window mapping fix.
-- O regenerar `blink.merged.bin` con offset correcto.
+- [x] `invalid header` ya no aparece.
+- [x] ROM carga los 3 segments del bootloader.
+- [x] ROM jumpea al bootloader entry.
+- [x] Bootloader code (en L2MEM `0x4FF29ED0`) ejecuta y llama ets_printf via ROM trampolines.
 
 ## Notas
 
-- Esto es **flash content / cache MMU** territory, no más CPU/peripheral emulation.
-- Cuando esto se desbloquee el bootloader Arduino correrá → app code → `setup()` y `loop()` Arduino → LED blink. Eso es Phase 2 (blink end-to-end).
+- La fix #1 (flash blob reload) puede simplificarse cuando Phase 2.A.6 (real cache MMU) lande — el cache window será MMIO, no RAM, así el BIOS ELF no podrá sobrescribir flash.
+- La fix #2 (`ets_loader_map_range` patch) también desaparecerá con Phase 2.A.6 — el MMU real hará la translación que la función espera.
+- Por ahora ambas son safety nets que mantienen el bootloader avanzando.
+
+## Archivos tocados
+
+- `hw/riscv/esp32p4.c` — añade flash reload pass (~30 LOC) + 3 ROM patches.

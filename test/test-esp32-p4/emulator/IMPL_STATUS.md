@@ -38,6 +38,17 @@
   - **Overrides agregados**: MSPI flash FSM idle (`0x5008C178 → 0x80000000`), Cache 0x098/0x2A8/0x2AC/0x2B0/0x2B4/0x2B8/0x2BC (suspend/resume/freeze acks), Cache 0x088/0x08C op-done (OR_MASK).
   - **Mirror table**: L1 freeze bit 20→22, bit 21→23 + L2 freeze idem (offsets 0x288, 0x28C).
   - Resultado: ROM atraviesa SPI_init, Cache_Suspend_L2_Cache, Cache_Suspend_L2_Cache_Autoload, Cache_Freeze_L2_Cache_Enable/Disable, Cache_Freeze_L1_DCache_Enable/Disable, ets_clock_init, etc. Llega a `ets_run_flash_bootloader` y ejecuta `_cvt` (printf) para imprimir `invalid header: 0x0b000ec1`. Próximo blocker: **Phase 2.A.5 — flash bootloader content/layout**.
+✅ **Phase 2.A.5** — **¡ROM carga el bootloader y le pasa el control!**
+  - **Causa raíz dual**: (1) BIOS ELF tiene PT_LOAD a `0x40000000` size `0x8BA4` que sobrescribe flash blob en cache window con ROM constants. (2) `ets_loader_map_range` espera cache MMU programado (no modelado) y devuelve garbage.
+  - **Fix 1 — Flash blob reload pass**: después del BIOS ELF load + section-data + ROM patches, re-`blk_pread` el flash blob sobre el cache window. Esto restaura los bytes de flash byte que el PT_LOAD del BIOS había clobbeado.
+  - **Fix 2 — `ets_loader_map_range` patch**: reemplazo en `0x4FC044CC` con `lui a0, 0x40000; add a0, a0, a1; ret` (12 bytes, 3 ROM patches). Bypassea param validation + MMU programming, devuelve linear identity address. Funciona porque nuestro flash blob se mapea linealmente al cache window.
+  - **Resultado**: ROM imprime `SPI mode:DIO, clock div:1`, carga 3 segments del bootloader (`load:0x4ff33ce0,len:0x1174`, etc), hace SHA-256 check (continúa pese al fail porque secure boot disabled), e invoca `entry 0x4ff29ed0` — saltando al bootloader Espressif!
+  - El bootloader Espressif corre en L2MEM, llama ets_printf vía ROM trampolines, y eventualmente assertea en `regi2c_enable_block, esp_rom_regi2c_esp32p4.c:90 (regi2c_ctrl_ll_master_is_clock_enabled())`. **Esto es nuestro código pre-app: el bootloader Espressif!** Phase 2.B.regi2c es siguiente. 🚀
+✅ **Phase 2.B.regi2c** — **¡Bootloader corre 6.4 segundos de regi2c init!**
+  - **LPPERI smart stub** (`0x50120000`, 1 KB): nueva región mapeada que antes daba 0.
+  - **`LPPERI_CLK_EN_REG` (offset 0)** OR_MASK con `0x7FFF0000` (bits 16-30 set, todos los LP peri clock-enables defaultean a 1 en silicon real). El bootloader lee bit 27 (LP_I2CMST) y ya no falla el assert.
+  - **`Reset/Clock 0x500E60BC`** OR_MASK con `0x4` (bit 2 set) — siguiente blocker después del regi2c assert. El bootloader hacía write-then-poll-bit-2 en ese registro post-regi2c-write esperando "config applied" status.
+  - Bootloader hace 6.4 segundos de regi2c writes (PMU/PLL/RTC/ADC analog config) y luego falla en otro assert: `boot_comm: mismatch chip ID, expected 18, found 0` — assert del bootloader que verifica chip_id en image header. Phase 2.B.boot_comm investiga dónde lee 0.
 ✅ **Phase 1.E — 4 unblocks consecutivos** `b0c4aad8f5`:
   - **SP init en el trampolín**: `sp` partía en 0, primera push escribía a `0xFFFFFFFC` → store fault. Trampolín ahora setea `sp = 0x4FF80000` (~256 KB dentro de L2MEM).
   - **Custom CSRs + CLIC standard como scratch RW**: 0x7C0-0x7FF + 0x307 (mtvt) + 0x345-0x349 (mnxti family) + 0xFB1 (mintstatus). El runtime IDF setea CLIC vectoring temprano y exige que esos CSRs acepten writes.
