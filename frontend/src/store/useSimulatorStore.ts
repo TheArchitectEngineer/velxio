@@ -138,6 +138,27 @@ class Esp32BridgeShim {
     this.bridge = bridge;
     this.pinManager = pm;
     this.i2cBusInstance = new I2CBusManager(nullI2CMaster());
+
+    // Wire the write-forwarding path: when the backend ProxySlave emits
+    // a completed write transaction (one full STOP-bounded master phase
+    // from the ESP32 firmware), look up the peer device on the local
+    // device lookup map and replay the bytes through its writeByte()
+    // contract.  Peer `I2CDevice` implementations (I2CMemoryDevice,
+    // VirtualPCF8574, VirtualSSD1306, …) already encode the
+    // pointer-byte + data semantics; we just hand off the sequence.
+    bridge.onProxyI2cComplete = (addr: number, data: number[]) => {
+      const dev = this._peerDeviceLookup.get(addr);
+      if (!dev) return;
+      try {
+        for (const b of data) dev.writeByte(b);
+        dev.stop?.();
+      } catch (e) {
+        console.warn(
+          `[Esp32BridgeShim] proxy write replay failed for 0x${addr.toString(16)}`,
+          e,
+        );
+      }
+    };
   }
 
   setPinState(pin: number, state: boolean): void {
@@ -327,35 +348,182 @@ class Esp32BridgeShim {
    * cross-board I2C bridge is installed so the ESP32 firmware's Wire
    * master reads can find the peer's devices inside QEMU.
    *
-   * The `peerBus` argument is the I2CBusManager of the other board;
-   * we snapshot each registered device with `dumpRegisters()` and
-   * forward the bytes via the WebSocket protocol.  Devices that don't
-   * expose a register dump (write-only sinks like SSD1306, PCF8574,
-   * LCD-I2C) are skipped — peer-master writes to those still work via
-   * the regular I2CBusManager.handleExternalWrite path because the
-   * device lives on the master's local bus too.
+   * Walks the peer bus AND its transitive bridges (BFS).  Each device
+   * found at any reachable hop gets a ProxySlave on the backend.  All
+   * addresses discovered through `peerBus` are tracked under that key,
+   * so `clearProxiesForPeer(peerBus)` cleans up exactly what this call
+   * installed without disturbing proxies from concurrent bridges
+   * (e.g. when another wire pair also connects to this same ESP32).
+   *
+   * Devices that don't expose `dumpRegisters` (PCF8574, SSD1306,
+   * LCD-I2C) are skipped — they receive state through the
+   * write-forwarding path (proxy_i2c_complete event from the backend
+   * ProxySlave) instead.
    */
   syncProxyFromPeer(peerBus: I2CBusManager): void {
-    if (typeof peerBus.listDevices !== 'function') return;
-    for (const device of peerBus.listDevices()) {
-      if (typeof device.dumpRegisters !== 'function') continue;
-      try {
-        const regs = device.dumpRegisters();
-        this.bridge.registerProxyI2c(device.address, regs);
-        this._proxiedAddrs.add(device.address);
-      } catch (e) {
-        console.warn(`[Esp32BridgeShim] syncProxyFromPeer dump failed for 0x${device.address.toString(16)}`, e);
+    const ownedAddrs = this._proxiedByPeer.get(peerBus) ?? new Set<number>();
+
+    // BFS over the peer's bridge graph.  Skip our own bus so we don't
+    // mirror ourselves back via the return edge.
+    const visited = new Set<I2CBusManager>([this.i2cBusInstance, peerBus]);
+    const queue: I2CBusManager[] = [peerBus];
+
+    while (queue.length > 0) {
+      const bus = queue.shift()!;
+      if (typeof bus.listDevices === 'function') {
+        for (const device of bus.listDevices()) {
+          // Track the live device reference for write-forwarding and
+          // periodic resync.  Last writer wins on address collisions
+          // (rare; the user wired two devices to the same address).
+          this._peerDeviceLookup.set(device.address, device);
+          if (typeof device.dumpRegisters !== 'function') continue;
+          try {
+            const regs = device.dumpRegisters();
+            this.bridge.registerProxyI2c(device.address, regs);
+            ownedAddrs.add(device.address);
+            // Prime the resync hash so the first tick doesn't push a
+            // redundant identical dump.
+            this._lastDumpHash.set(
+              device.address,
+              Esp32BridgeShim._hashRegs(regs),
+            );
+          } catch (e) {
+            console.warn(
+              `[Esp32BridgeShim] syncProxyFromPeer dump failed for 0x${device.address.toString(16)}`,
+              e,
+            );
+          }
+        }
       }
+      if (typeof bus.getBridges === 'function') {
+        for (const next of bus.getBridges()) {
+          if (visited.has(next)) continue;
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+    }
+
+    if (ownedAddrs.size > 0) {
+      this._proxiedByPeer.set(peerBus, ownedAddrs);
+      this._ensureResyncTimer();
     }
   }
 
-  /** Tear down every proxy slave we previously installed. */
-  clearAllProxies(): void {
-    for (const addr of this._proxiedAddrs) this.bridge.unregisterProxyI2c(addr);
-    this._proxiedAddrs.clear();
+  /**
+   * Tear down only the proxies that `syncProxyFromPeer(peerBus)`
+   * installed.  Safe to call multiple times; idempotent.  Other
+   * concurrent bridges (different peer buses) retain their proxies.
+   */
+  clearProxiesForPeer(peerBus: I2CBusManager): void {
+    const owned = this._proxiedByPeer.get(peerBus);
+    if (!owned) return;
+    for (const addr of owned) {
+      // Only unregister if no other peer also claims this address.
+      let claimedElsewhere = false;
+      for (const [other, set] of this._proxiedByPeer) {
+        if (other !== peerBus && set.has(addr)) {
+          claimedElsewhere = true;
+          break;
+        }
+      }
+      if (!claimedElsewhere) {
+        this.bridge.unregisterProxyI2c(addr);
+        this._peerDeviceLookup.delete(addr);
+        this._lastDumpHash.delete(addr);
+      }
+    }
+    this._proxiedByPeer.delete(peerBus);
+    this._stopResyncTimerIfIdle();
   }
 
-  private _proxiedAddrs = new Set<number>();
+  /**
+   * Tear down EVERY proxy slave we've installed.  Used on full board
+   * stop / disconnect — `clearProxiesForPeer` is preferred for
+   * single-wire-pair teardowns.
+   */
+  clearAllProxies(): void {
+    for (const set of this._proxiedByPeer.values()) {
+      for (const addr of set) this.bridge.unregisterProxyI2c(addr);
+    }
+    this._proxiedByPeer.clear();
+    this._peerDeviceLookup.clear();
+    this._lastDumpHash.clear();
+    this._stopResyncTimerIfIdle();
+  }
+
+  /** Per-peer set of addresses we've mirrored.  Cleanup keyed by peer bus. */
+  private _proxiedByPeer = new Map<I2CBusManager, Set<number>>();
+  /** Address → live frontend device, for write-forwarding & periodic resync. */
+  private _peerDeviceLookup = new Map<number, I2CDevice>();
+  /** Periodic resync timer — runs while any proxy is live. */
+  private _resyncTimer: ReturnType<typeof setInterval> | null = null;
+  /** Cheap hash of the last dumped register set per address, to skip WS pushes when unchanged. */
+  private _lastDumpHash = new Map<number, number>();
+
+  /**
+   * Periodic resync interval in ms.  250 ms strikes the balance
+   * between WS bandwidth and human-perceivable RTC freshness; see
+   * the architecture rationale in the plan file.  Exposed for tests
+   * that want a faster cadence via fake timers.
+   */
+  static RESYNC_INTERVAL_MS = 250;
+
+  private _ensureResyncTimer(): void {
+    if (this._resyncTimer !== null) return;
+    if (this._proxiedByPeer.size === 0) return;
+    this._resyncTimer = setInterval(
+      () => this._resyncTick(),
+      Esp32BridgeShim.RESYNC_INTERVAL_MS,
+    );
+  }
+
+  private _stopResyncTimerIfIdle(): void {
+    if (this._proxiedByPeer.size === 0 && this._resyncTimer !== null) {
+      clearInterval(this._resyncTimer);
+      this._resyncTimer = null;
+      this._lastDumpHash.clear();
+    }
+  }
+
+  /**
+   * Cheap XOR-stride hash over a 256-byte buffer.  Detects any byte
+   * difference; collisions are theoretically possible but we don't
+   * care — a missed update on a flaky hash just delays freshness by
+   * one cycle.
+   */
+  private static _hashRegs(regs: Uint8Array): number {
+    let h = regs.length & 0xff;
+    for (let i = 0; i < regs.length; i += 16) {
+      h = ((h << 5) - h + regs[i]) | 0;
+    }
+    for (let i = 0; i < Math.min(regs.length, 8); i++) {
+      h = ((h << 5) - h + regs[i]) | 0;
+    }
+    return h;
+  }
+
+  private _resyncTick(): void {
+    // Union of all proxied addresses across peers.
+    const seen = new Set<number>();
+    for (const set of this._proxiedByPeer.values()) {
+      for (const addr of set) seen.add(addr);
+    }
+    for (const addr of seen) {
+      const device = this._peerDeviceLookup.get(addr);
+      if (!device || typeof device.dumpRegisters !== 'function') continue;
+      let regs: Uint8Array;
+      try {
+        regs = device.dumpRegisters();
+      } catch {
+        continue;
+      }
+      const h = Esp32BridgeShim._hashRegs(regs);
+      if (this._lastDumpHash.get(addr) === h) continue;
+      this._lastDumpHash.set(addr, h);
+      this.bridge.updateProxyI2c(addr, regs);
+    }
+  }
 }
 
 // ── Shared LEDC update handler (used by addBoard, setBoardType, initSimulator) ─
@@ -771,6 +939,13 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
         // can call setPinState / access pinManager on ESP32 boards.
         const shim = new Esp32BridgeShim(bridge, pm);
         shim.onSerialData = serialCallback;
+        // If a shim already exists for this id (e.g. tests recreate the
+        // same kind after reset), dispose any active proxies / timers
+        // so the orphaned instance doesn't keep firing.
+        const existingShim = simulatorMap.get(id) as any;
+        if (existingShim?.clearAllProxies) {
+          try { existingShim.clearAllProxies(); } catch { /* ignore */ }
+        }
         simulatorMap.set(id, shim);
       } else {
         const sim = createSimulator(

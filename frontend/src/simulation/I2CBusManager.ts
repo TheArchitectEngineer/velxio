@@ -126,6 +126,15 @@ export class I2CBusManager implements TWIEventHandler {
     return Array.from(this.devices.values());
   }
 
+  /**
+   * Read-only view of bridges currently attached to this bus.  Used by
+   * the cross-board proxy sync to walk transitive peers (BFS).  Not
+   * meant for mutation — call {@link attachBridge} / {@link detachBridge}.
+   */
+  getBridges(): readonly I2CBusManager[] {
+    return this.bridges;
+  }
+
   // ── Cross-board bridging ────────────────────────────────────────────────
 
   /**
@@ -180,9 +189,15 @@ export class I2CBusManager implements TWIEventHandler {
       this.master.completeConnect(true);
       return;
     }
-    // 2. Try each bridged peer in registration order.
+    // 2. Walk the bridge graph (BFS) until a peer ACKs `addr`.  The
+    //    visited Set starts with `this` so we don't bounce back into
+    //    ourselves through a peer that has us in its own bridge list.
+    //    Each peer recurses into its own bridges via
+    //    `handleExternalConnect`, also passing visited.
+    const visited = new Set<I2CBusManager>([this]);
     for (const bridge of this.bridges) {
-      if (bridge.handleExternalConnect(addr, write)) {
+      if (visited.has(bridge)) continue;
+      if (bridge.handleExternalConnect(addr, write, visited)) {
         this.activeExternal = bridge;
         this.activeDevice = null;
         this.writeMode = write;
@@ -190,7 +205,7 @@ export class I2CBusManager implements TWIEventHandler {
         return;
       }
     }
-    // 3. NACK — no device anywhere knows this address.
+    // 3. NACK — no device anywhere in the topology knows this address.
     this.activeDevice = null;
     this.activeExternal = null;
     this.master.completeConnect(false);
@@ -219,15 +234,39 @@ export class I2CBusManager implements TWIEventHandler {
   // ── External-master inbound handlers (called by a bridged peer bus) ────
 
   /**
-   * Attempt to address `addr` on this bus's local devices on behalf of
-   * an external master.  Returns true when this bus has a device that
-   * acknowledged the addressing phase, false otherwise (NACK).
+   * Attempt to address `addr` on behalf of an external master.  Returns
+   * true when SOMEONE in the reachable bridge graph has a device at the
+   * address, false otherwise (NACK).
+   *
+   * The `visited` Set tracks buses already consulted so we never loop
+   * back through cycles in the bridge graph.  When the device is on a
+   * deeper hop (e.g. A→B→C with the device on C), this bus simply
+   * delegates: it records the bridge that resolved the address as its
+   * `externalActiveDevice`-proxy via a forwarding device shim, so the
+   * subsequent write/read/stop calls walk the same chain.
    */
-  handleExternalConnect(addr: number, _write: boolean): boolean {
-    const dev = this.devices.get(addr);
-    if (!dev) return false;
-    this.externalActiveDevice = dev;
-    return true;
+  handleExternalConnect(addr: number, write: boolean, visited?: Set<I2CBusManager>): boolean {
+    const v = visited ?? new Set<I2CBusManager>();
+    if (v.has(this)) return false;
+    v.add(this);
+
+    // First try local devices.
+    const local = this.devices.get(addr);
+    if (local) {
+      this.externalActiveDevice = local;
+      return true;
+    }
+    // Then recurse into peers (BFS).  If one of them ACKs, install a
+    // forwarder so this bus's read/write/stop calls delegate down the
+    // chain transparently.
+    for (const bridge of this.bridges) {
+      if (v.has(bridge)) continue;
+      if (bridge.handleExternalConnect(addr, write, v)) {
+        this.externalActiveDevice = createForwarderDevice(addr, bridge);
+        return true;
+      }
+    }
+    return false;
   }
 
   /** External master is sending a byte to the previously-addressed device. */
@@ -261,6 +300,30 @@ export function nullI2CMaster(): I2CMaster {
     completeConnect(_ack: boolean) {},
     completeWrite(_ack: boolean) {},
     completeRead(_value: number) {},
+  };
+}
+
+/**
+ * Internal: build a transparent `I2CDevice` shim that forwards every
+ * write/read/stop down the bridge chain to a peer bus.  Used by
+ * `handleExternalConnect` when the requested address resolves to a
+ * device living two or more hops away — the intermediate bus stores
+ * one of these shims as its `externalActiveDevice` so the existing
+ * `handleExternalWrite/Read/Stop` machinery routes through without
+ * needing per-method visited tracking.
+ */
+function createForwarderDevice(addr: number, downstream: I2CBusManager): I2CDevice {
+  return {
+    address: addr,
+    writeByte(value: number): boolean {
+      return downstream.handleExternalWrite(value);
+    },
+    readByte(): number {
+      return downstream.handleExternalRead();
+    },
+    stop(): void {
+      downstream.handleExternalStop();
+    },
   };
 }
 

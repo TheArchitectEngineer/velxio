@@ -429,6 +429,103 @@ describe('ESP32 I2C — reverse-direction proxy (ESP32 master reads peer device)
   );
 });
 
+// ─── Phase 5: write-forwarding via proxy_i2c_complete event ─────────────────
+
+const WRITER_TO_PEER_SKETCH_PATH = resolve(
+  __dirname,
+  '../../../test/test_custom_chips/sketches/esp32_i2c_write_to_peer/esp32_i2c_write_to_peer.ino',
+);
+const WRITER_TO_PEER_SKETCH_AVAILABLE = existsSync(WRITER_TO_PEER_SKETCH_PATH);
+
+describe('ESP32 I2C — write-forwarding from QEMU back to frontend peer device', () => {
+  it.runIf(WRITER_TO_PEER_SKETCH_AVAILABLE && BACKEND_AVAILABLE)(
+    'firmware Wire.write(0xAA) to 0x27 reaches the proxy_i2c_complete handler',
+    async () => {
+      const source = readFileSync(WRITER_TO_PEER_SKETCH_PATH, 'utf-8');
+      const compiled = await compileViaBackend(source);
+      expect(compiled.success).toBe(true);
+
+      // We register a ProxySlave at 0x27 and watch for the
+      // proxy_i2c_complete event arriving when the firmware emits its
+      // STOP.  The data array should include the byte the firmware
+      // wrote (0xAA).
+      const regs = new Uint8Array(256);
+
+      const url =
+        BACKEND_URL.replace(/^http/, 'ws') +
+        `/api/simulation/ws/test-${Date.now()}`;
+      const ws = new WebSocket(url);
+      const proxyCompletes: Array<{ addr: number; data: number[] }> = [];
+      let booted = false;
+
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = (e: any) => reject(new Error(`ws: ${e?.message ?? e}`));
+        setTimeout(() => reject(new Error('ws open timeout')), 5000);
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'start_esp32',
+          data: { board: 'esp32', firmware_b64: compiled.binary_content! },
+        }),
+      );
+
+      await new Promise<void>((resolve) => {
+        const deadline = Date.now() + 30_000;
+        const tick = setInterval(() => {
+          const done = proxyCompletes.some(
+            (p) => p.addr === 0x27 && p.data.includes(0xaa),
+          );
+          if (done || Date.now() >= deadline) {
+            clearInterval(tick);
+            try {
+              ws.send(JSON.stringify({ type: 'stop_esp32' }));
+            } catch {
+              /* ignore */
+            }
+            ws.close();
+            resolve();
+          }
+        }, 200);
+
+        ws.onmessage = (ev) => {
+          let msg: any;
+          try {
+            msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString());
+          } catch {
+            return;
+          }
+          if (msg.type === 'system' && msg.data?.event === 'booted' && !booted) {
+            booted = true;
+            const regs_b64 = Buffer.from(regs).toString('base64');
+            ws.send(
+              JSON.stringify({
+                type: 'esp32_proxy_i2c_register',
+                data: { addr: 0x27, regs_b64 },
+              }),
+            );
+          } else if (msg.type === 'proxy_i2c_complete') {
+            proxyCompletes.push({
+              addr: msg.data.addr,
+              data: msg.data.data,
+            });
+          }
+        };
+        ws.onclose = () => {
+          clearInterval(tick);
+          resolve();
+        };
+      });
+
+      const writes = proxyCompletes.filter((p) => p.addr === 0x27);
+      expect(writes.length).toBeGreaterThan(0);
+      expect(writes.some((w) => w.data.includes(0xaa))).toBe(true);
+    },
+    900_000,
+  );
+});
+
 describe.skipIf(BACKEND_AVAILABLE)(
   'ESP32 I2C — skipped (backend not reachable at ' + BACKEND_URL + ')',
   () => {

@@ -92,17 +92,18 @@ const i2cBridges = new Map<string, () => void>();
 
 function isBrowserSim(boardKind: string): boolean {
   // Browser-side simulators expose a `setPinState` method directly on the
-  // simulator instance (AVR, RP2040, RiscV/ESP32-C3, Esp32BridgeShim).
+  // simulator instance (AVR, RP2040).  ESP32-C3 family was historically
+  // here when Esp32C3Simulator ran in-browser, but per the store's
+  // ESP32_RISCV_KINDS routing the c3 boards now go through the same
+  // Esp32Bridge (qemu-system-riscv32 via libqemu-riscv32.dll) as the
+  // Xtensa ESP32s — so they belong on the bridge side.
   return (
     boardKind === 'arduino-uno' ||
     boardKind === 'arduino-nano' ||
     boardKind === 'arduino-mega' ||
     boardKind === 'attiny85' ||
     boardKind === 'raspberry-pi-pico' ||
-    boardKind === 'pi-pico-w' ||
-    boardKind === 'esp32-c3' ||
-    boardKind === 'xiao-c3' ||
-    boardKind === 'c3-supermini'
+    boardKind === 'pi-pico-w'
   );
 }
 
@@ -112,7 +113,16 @@ function isEsp32Bridge(boardKind: string): boolean {
     boardKind === 'esp32-s3' ||
     boardKind === 'esp32-devkit-c-v4' ||
     boardKind === 'esp32-cam' ||
-    boardKind === 'wemos-lolin32-lite'
+    boardKind === 'wemos-lolin32-lite' ||
+    boardKind === 'xiao-esp32-s3' ||
+    boardKind === 'arduino-nano-esp32' ||
+    // RISC-V ESP32-C3 family — same Esp32Bridge plumbing, just a
+    // different QEMU binary on the backend (libqemu-riscv32).
+    boardKind === 'esp32-c3' ||
+    boardKind === 'xiao-esp32-c3' ||
+    boardKind === 'aitewinrobot-esp32c3-supermini' ||
+    boardKind === 'xiao-c3' ||
+    boardKind === 'c3-supermini'
   );
 }
 
@@ -597,19 +607,20 @@ function updateI2CBridges(wires: readonly Wire[]): void {
       } catch {
         /* ignore */
       }
-      // Remove the proxy slaves we installed in the ESP32 worker.
-      // Cleared per-shim so other concurrent bridges keep their own
-      // proxies intact.
+      // Remove ONLY the proxy slaves this bridge installed.  Per-peer
+      // teardown so concurrent bridges to the same ESP32 (e.g. ESP32
+      // wired to both an Uno and a Pico simultaneously) retain their
+      // own proxies — addresses owned by another peer survive.
       if (isEsp32Bridge(boards.get(want.aBoard)?.kind ?? '')) {
         const simA = runtime?.getBoardSimulator(want.aBoard);
-        if (simA?.clearAllProxies) {
-          try { simA.clearAllProxies(); } catch { /* ignore */ }
+        if (simA?.clearProxiesForPeer) {
+          try { simA.clearProxiesForPeer(busB); } catch { /* ignore */ }
         }
       }
       if (isEsp32Bridge(boards.get(want.bBoard)?.kind ?? '')) {
         const simB = runtime?.getBoardSimulator(want.bBoard);
-        if (simB?.clearAllProxies) {
-          try { simB.clearAllProxies(); } catch { /* ignore */ }
+        if (simB?.clearProxiesForPeer) {
+          try { simB.clearProxiesForPeer(busA); } catch { /* ignore */ }
         }
       }
     });

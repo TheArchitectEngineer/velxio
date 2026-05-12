@@ -1611,7 +1611,12 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             except Exception as exc:
                 _log(f'proxy_i2c_register: bad base64: {exc}')
                 regs = b''
-            _i2c_slaves[i2c_addr] = _ProxySlave(i2c_addr, regs)
+            # Pass _emit so writes from the ESP32 firmware get forwarded
+            # back to the frontend as `proxy_i2c_complete` events.  The
+            # frontend then replays the byte sequence on the actual
+            # peer I2CDevice so its state (PCF8574 latch, SSD1306
+            # GDDRAM, memory device registers …) stays in sync.
+            _i2c_slaves[i2c_addr] = _ProxySlave(i2c_addr, regs, emit_fn=_emit)
             _log(f'proxy_i2c registered at 0x{i2c_addr:02x} ({len(regs)} bytes)')
 
         elif c == 'proxy_i2c_update':

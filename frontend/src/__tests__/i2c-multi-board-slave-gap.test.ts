@@ -238,3 +238,121 @@ describe('I2C bug — multi-board slave gap (issue #38 / Discord)', () => {
     expect(masterTwi.calls).toContain('connect:false'); // NACK — isolated again
   });
 });
+
+describe('I2C multi-hop routing (3+ board chains)', () => {
+  it('A↔B↔C: master on A reaches device on C through B (BFS)', () => {
+    // Topology:
+    //   A.bus ─── B.bus ─── C.bus
+    //                       │
+    //                       └── I2CMemoryDevice(0x42)
+    //
+    // Bridges installed bidirectionally between each adjacent pair,
+    // mimicking what Interconnect.updateI2CBridges does when the user
+    // wires SDA+SCL between three boards.  Board A has no direct
+    // bridge to C, but the BFS walk through B's `getBridges()` reaches
+    // it.
+    const aTwi = makeTWI();
+    const bTwi = makeTWI();
+    const cTwi = makeTWI();
+    const aBus = new I2CBusManager(aTwi as any);
+    const bBus = new I2CBusManager(bTwi as any);
+    const cBus = new I2CBusManager(cTwi as any);
+
+    // A↔B
+    aBus.attachBridge(bBus);
+    bBus.attachBridge(aBus);
+    // B↔C
+    bBus.attachBridge(cBus);
+    cBus.attachBridge(bBus);
+
+    const memDevice = new I2CMemoryDevice(0x42);
+    cBus.addDevice(memDevice);
+
+    // A writes pointer 0x05, data 0xCC across two hops.
+    aBus.start(false);
+    aBus.connectToSlave(0x42, true);
+    aBus.writeByte(0x05);
+    aBus.writeByte(0xcc);
+    aBus.stop();
+
+    expect(aTwi.calls).toContain('connect:true');
+    expect(memDevice.registers[0x05]).toBe(0xcc);
+  });
+
+  it('A↔B↔C: read flows back through both hops', () => {
+    const aTwi = makeTWI();
+    const bTwi = makeTWI();
+    const cTwi = makeTWI();
+    const aBus = new I2CBusManager(aTwi as any);
+    const bBus = new I2CBusManager(bTwi as any);
+    const cBus = new I2CBusManager(cTwi as any);
+    aBus.attachBridge(bBus);
+    bBus.attachBridge(aBus);
+    bBus.attachBridge(cBus);
+    cBus.attachBridge(bBus);
+
+    const memDevice = new I2CMemoryDevice(0x42);
+    memDevice.registers[0x00] = 0xab;
+    memDevice.registers[0x01] = 0xcd;
+    cBus.addDevice(memDevice);
+
+    aBus.start(false);
+    aBus.connectToSlave(0x42, true);
+    aBus.writeByte(0x00); // pointer
+    aBus.start(true); // repeated start
+    aBus.connectToSlave(0x42, false); // switch to read
+    aBus.readByte(true);
+    aBus.readByte(false);
+    aBus.stop();
+
+    const reads = aTwi.calls.filter((c) => c.startsWith('read:'));
+    expect(reads).toContain('read:171'); // 0xAB
+    expect(reads).toContain('read:205'); // 0xCD
+  });
+
+  it('cycles in the bridge graph do not cause infinite recursion', () => {
+    // A↔B↔C and ALSO A↔C — forms a triangle.  Visited Set must
+    // prevent the BFS from looping back through the long way around.
+    const aTwi = makeTWI();
+    const bTwi = makeTWI();
+    const cTwi = makeTWI();
+    const aBus = new I2CBusManager(aTwi as any);
+    const bBus = new I2CBusManager(bTwi as any);
+    const cBus = new I2CBusManager(cTwi as any);
+    aBus.attachBridge(bBus);
+    bBus.attachBridge(aBus);
+    bBus.attachBridge(cBus);
+    cBus.attachBridge(bBus);
+    aBus.attachBridge(cBus); // direct A↔C edge as well
+    cBus.attachBridge(aBus);
+
+    const memDevice = new I2CMemoryDevice(0x55);
+    cBus.addDevice(memDevice);
+
+    aBus.start(false);
+    aBus.connectToSlave(0x55, true);
+    aBus.writeByte(0x00);
+    aBus.writeByte(0x99);
+    aBus.stop();
+
+    expect(memDevice.registers[0x00]).toBe(0x99);
+  });
+
+  it('NACKs cleanly when the address exists nowhere in the graph', () => {
+    const aBus = new I2CBusManager(makeTWI() as any);
+    const bBus = new I2CBusManager(makeTWI() as any);
+    const cBus = new I2CBusManager(makeTWI() as any);
+    aBus.attachBridge(bBus);
+    bBus.attachBridge(aBus);
+    bBus.attachBridge(cBus);
+    cBus.attachBridge(bBus);
+
+    const aTwi = makeTWI();
+    const aBusInstrumented = new I2CBusManager(aTwi as any);
+    aBusInstrumented.attachBridge(bBus);
+    bBus.attachBridge(aBusInstrumented);
+
+    aBusInstrumented.connectToSlave(0x77, true);
+    expect(aTwi.calls).toContain('connect:false');
+  });
+});

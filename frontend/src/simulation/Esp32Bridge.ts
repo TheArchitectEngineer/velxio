@@ -110,6 +110,14 @@ export class Esp32Bridge {
     | null = null;
   onI2cEvent: ((addr: number, data: number) => void) | null = null;
   onI2cTransaction: ((addr: number, data: number[]) => void) | null = null;
+  /**
+   * Fires when the backend's `ProxySlave` emits a completed write
+   * transaction (one full master write phase, terminated by STOP or
+   * repeated-START).  Used by Interconnect / Esp32BridgeShim to
+   * replay the bytes onto the actual frontend peer device so its
+   * state stays consistent with what the ESP32 firmware "wrote".
+   */
+  onProxyI2cComplete: ((addr: number, data: number[]) => void) | null = null;
   onSpiEvent: ((data: number) => void) | null = null;
   /** Same as onSpiEvent but more explicit (a single MOSI byte). */
   onSpiByte: ((mosi: number) => void) | null = null;
@@ -291,6 +299,18 @@ export class Esp32Bridge {
           const addr = msg.data.addr as number;
           const data = msg.data.data as number[];
           this.onI2cTransaction?.(addr, data);
+          break;
+        }
+        case 'proxy_i2c_complete': {
+          // Backend `ProxySlave` saw a full I2C write transaction from
+          // the ESP32 firmware and is forwarding the bytes back so the
+          // frontend can replay them on the actual peer device.  The
+          // peer's `I2CDevice.writeByte` handles its own state machine
+          // (pointer-byte first, then data) — we just hand off the
+          // sequence in order.
+          const addr = msg.data.addr as number;
+          const data = msg.data.data as number[];
+          this.onProxyI2cComplete?.(addr, data);
           break;
         }
         case 'spi_batch': {
