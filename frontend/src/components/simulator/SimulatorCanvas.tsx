@@ -63,6 +63,13 @@ const LONG_PRESS_MS = 500;
 /** Max movement during long-press before it cancels (px). */
 const LONG_PRESS_MOVE_TOLERANCE = 8;
 
+/**
+ * Distance (px, screen) a touch must drift before a passthrough-to-
+ * wokwi-element touch is promoted to a component drag. Set just above
+ * normal tap jitter so accidental drags from a finger press are rare.
+ */
+const DRAG_PROMOTE_THRESHOLD_PX = 8;
+
 /** Check if a board kind is an ESP32-family board. */
 function isEsp32Kind(kind: BoardKind): boolean {
   return (
@@ -334,6 +341,15 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   const selectedWireIdRef = useRef(selectedWireId);
   selectedWireIdRef.current = selectedWireId;
   const touchPassthroughRef = useRef(false);
+  // While `touchPassthroughRef` is true (touch let through to an interactive
+  // wokwi-element while the simulation runs), we still remember which
+  // component the touch started on. If the finger drifts past
+  // DRAG_PROMOTE_THRESHOLD_PX, we cancel the passthrough and start a real
+  // drag — so the user can rearrange interactive parts live without first
+  // pausing the simulation.
+  const pendingTouchDragRef = useRef<
+    { componentId: string; startX: number; startY: number } | null
+  >(null);
   const touchOnPinRef = useRef(false);
   const lastTapTimeRef = useRef(0);
 
@@ -434,6 +450,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
       // Reset per-gesture flags
       touchOnPinRef.current = false;
       touchPassthroughRef.current = false;
+      pendingTouchDragRef.current = null;
       pinchStartDistRef.current = 0;
 
       if (e.touches.length === 2) {
@@ -487,10 +504,19 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
       //    touch-action:none on .canvas-content already prevents browser scroll/zoom.
       // Board-less SPICE circuits piggy-back on the same path so a tap on
       // a slide-switch reaches the wokwi element and triggers its toggle.
+      // We still remember the starting position + component id so that if
+      // the finger drifts past DRAG_PROMOTE_THRESHOLD_PX onTouchMove can
+      // cancel the passthrough and start a real drag, letting the user
+      // rearrange interactive parts live without pausing the simulation.
       if (interactionRunningRef.current) {
         const webComp = target?.closest('.web-component-container');
         if (webComp) {
           touchPassthroughRef.current = true;
+          const componentWrapper = target?.closest('[data-component-id]') as HTMLElement | null;
+          const cid = componentWrapper?.getAttribute('data-component-id') || null;
+          pendingTouchDragRef.current = cid
+            ? { componentId: cid, startX: touch.clientX, startY: touch.clientY }
+            : null;
           // Don't preventDefault → browser synthesizes mouse events for the component
           return;
         }
@@ -579,7 +605,60 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
 
     const onTouchMove = (e: TouchEvent) => {
       // Let interactive components handle their own touch (potentiometer drag, etc.)
-      if (touchPassthroughRef.current) return;
+      // — UNLESS the finger has drifted past DRAG_PROMOTE_THRESHOLD_PX,
+      // in which case we cancel the passthrough and start a real component
+      // drag. Lets users rearrange parts during simulation without pausing.
+      if (touchPassthroughRef.current) {
+        const pending = pendingTouchDragRef.current;
+        if (pending && e.touches.length === 1) {
+          const t = e.touches[0];
+          const dx = t.clientX - pending.startX;
+          const dy = t.clientY - pending.startY;
+          if (dx * dx + dy * dy > DRAG_PROMOTE_THRESHOLD_PX * DRAG_PROMOTE_THRESHOLD_PX) {
+            const component = componentsRef.current.find((c) => c.id === pending.componentId);
+            if (component) {
+              const world = toWorld(t.clientX, t.clientY);
+              touchDraggedComponentIdRef.current = pending.componentId;
+              touchDragOffsetRef.current = {
+                x: world.x - component.x,
+                y: world.y - component.y,
+              };
+              // Snapshot the drag start position so touchend can fold the
+              // move into a single undoable Move command, mirroring the
+              // mouse-drag path.
+              dragStartPosRef.current = { x: component.x, y: component.y };
+              touchClickStartTimeRef.current = Date.now();
+              touchClickStartPosRef.current = { x: t.clientX, y: t.clientY };
+              // Release any pending press the wokwi-element registered when
+              // the browser synthesized the initial mousedown at touchstart.
+              // Without this the interactive part (button, switch knob) stays
+              // visually held until the user taps it again.
+              const target = document.elementFromPoint(pending.startX, pending.startY);
+              if (target) {
+                target.dispatchEvent(
+                  new MouseEvent('mouseup', {
+                    bubbles: true,
+                    cancelable: true,
+                    clientX: pending.startX,
+                    clientY: pending.startY,
+                  }),
+                );
+                target.dispatchEvent(
+                  new MouseEvent('mouseleave', { bubbles: false }),
+                );
+              }
+            }
+            touchPassthroughRef.current = false;
+            pendingTouchDragRef.current = null;
+            e.preventDefault();
+            // Fall through to normal touch-drag handling below.
+          } else {
+            return;
+          }
+        } else {
+          return;
+        }
+      }
       // Pin touch: no move processing needed
       if (touchOnPinRef.current) {
         e.preventDefault();
@@ -705,6 +784,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
       // Let interactive components handle their own touch
       if (touchPassthroughRef.current) {
         touchPassthroughRef.current = false;
+        pendingTouchDragRef.current = null;
         return;
       }
       // Pin touch: let pin's onTouchEnd React handler deal with it

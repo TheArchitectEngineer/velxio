@@ -352,6 +352,14 @@ export const DynamicComponent: React.FC<DynamicComponentProps> = ({
     };
   }, [id, handleComponentEvent, metadata.id, simulator, hexEpoch, wireFingerprint]);
 
+  // The wrapper uses `onMouseDownCapture` (not `onMouseDown`) so it sees
+  // the mousedown BEFORE the inner wokwi-element. Interactive wokwi parts
+  // (pushbutton, slide-switch, potentiometer …) call stopPropagation in
+  // their own bubble-phase handlers, which used to prevent any drag from
+  // starting once the simulator was running. Capture phase fires first
+  // and lets the canvas's drag-threshold logic distinguish click vs drag
+  // at mouseup time — so the user can rearrange interactive components
+  // while simulation is live.
   return (
     <div
       className="dynamic-component-wrapper"
@@ -369,7 +377,7 @@ export const DynamicComponent: React.FC<DynamicComponentProps> = ({
         transform: properties.rotation ? `rotate(${properties.rotation}deg)` : undefined,
         transformOrigin: 'center center',
       }}
-      onMouseDown={handleMouseDown}
+      onMouseDownCapture={handleMouseDown}
       onDoubleClick={handleDoubleClick}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
