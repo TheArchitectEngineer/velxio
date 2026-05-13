@@ -82,6 +82,11 @@ async def lifespan(_app: FastAPI):
             "ALTER TABLE users ADD COLUMN subscription_status VARCHAR(20)",
             "ALTER TABLE users ADD COLUMN subscription_period_end DATETIME",
             "ALTER TABLE users ADD COLUMN odoo_partner_id INTEGER",
+            # Agent quota tier — defaults to 'free' so existing rows that
+            # predate the quota system land in the free bucket. Admins +
+            # paid subs get bumped to 'pro' / 'pro_max' via the
+            # velxio_subscription Odoo webhook.
+            "ALTER TABLE users ADD COLUMN plan_id VARCHAR(20) NOT NULL DEFAULT 'free'",
         ]
         for stmt in legacy_migrations:
             try:

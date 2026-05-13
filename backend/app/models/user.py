@@ -38,5 +38,11 @@ class User(Base):
     subscription_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     subscription_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     odoo_partner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Agent quota tier — drives /api/pro/agent/llm rate-limiting via the
+    # PLANS dict in pro/services/quota.py. Defaults to 'free' so anyone
+    # who registers can start using the chat panel right away (subject to
+    # the free-tier daily cap). Bumped to 'pro' / 'pro_max' on successful
+    # PayPal subscription via the velxio_subscription Odoo webhook.
+    plan_id: Mapped[str] = mapped_column(String(20), default="free", nullable=False, index=True)
 
     projects: Mapped[list["Project"]] = relationship("Project", back_populates="owner", lazy="select")  # noqa: F821
