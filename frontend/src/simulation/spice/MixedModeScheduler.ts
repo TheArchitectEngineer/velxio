@@ -69,10 +69,16 @@ type SubscriptionToken = number;
  * but does NOT yet drive real SPICE solves on pin edges.  Phase 1b
  * continued: implement the alter+tran+readVec loop, hook NetlistBuilder.
  */
+/** Voltage cache key = `${componentId}|${componentPinName}`. */
+function pinKey(componentId: string, componentPinName: string): string {
+  return `${componentId}|${componentPinName}`;
+}
+
 class MixedModeSchedulerImpl implements SpiceVoltageSource {
   private engine: NgSpiceInteractive | null = null;
   private nextToken: SubscriptionToken = 1;
   private subscriptions = new Map<SubscriptionToken, NodeSubscription>();
+  private voltages = new Map<string, number>();
   private running = false;
   private initPromise: Promise<void> | null = null;
 
@@ -152,13 +158,38 @@ class MixedModeSchedulerImpl implements SpiceVoltageSource {
 
   /**
    * Look up the latest known voltage on a component pin's SPICE net.
-   * Phase 1b skeleton: always returns null (we haven't started solving
-   * yet).  Phase 1b continued: query the NgSpiceInteractive engine's
-   * last `readVec` cache and return the latest sample.
+   * Returns the value last published via `publishVoltage`, or null if
+   * nothing has been published for that pin yet.  Phase 1b continued
+   * will populate this cache from `NgSpiceInteractive.readVec` after
+   * each solve.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  getCurrentVoltage(_componentId: string, _componentPinName: string): number | null {
-    return null;
+  getCurrentVoltage(componentId: string, componentPinName: string): number | null {
+    const v = this.voltages.get(pinKey(componentId, componentPinName));
+    return v === undefined ? null : v;
+  }
+
+  /**
+   * Publish a freshly-resolved voltage for a (component, pin) and
+   * notify all subscribers watching that key.  Stores the value in
+   * the cache so subsequent `getCurrentVoltage` calls see it.
+   *
+   * The SPICE-resolved PinResolver does its own threshold conversion,
+   * so this layer only forwards raw volts with a placeholder
+   * `'UNKNOWN'` state — the resolver re-derives HIGH/LOW from the
+   * voltage using its configured thresholds.  Skipping the threshold
+   * decision here keeps the scheduler I/O-family-agnostic.
+   */
+  publishVoltage(componentId: string, componentPinName: string, voltage: number): void {
+    this.voltages.set(pinKey(componentId, componentPinName), voltage);
+    for (const sub of this.subscriptions.values()) {
+      if (sub.componentId === componentId && sub.componentPinName === componentPinName) {
+        // 'UNKNOWN' is a sentinel — the SpiceResolvedPinResolver re-
+        // computes the state from the voltage via its threshold
+        // configuration.  We could pass any string here; 'UNKNOWN' is
+        // the convention used in the Phase 1b unit tests.
+        sub.cb('UNKNOWN' as PinState, voltage);
+      }
+    }
   }
 
   /**
