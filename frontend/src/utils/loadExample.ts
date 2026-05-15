@@ -8,6 +8,7 @@ import type { BoardKind } from '../types/board';
 import { useEditorStore } from '../store/useEditorStore';
 import { useSimulatorStore, DEFAULT_BOARD_POSITION } from '../store/useSimulatorStore';
 import { useElectricalStore } from '../store/useElectricalStore';
+import { useProjectStore } from '../store/useProjectStore';
 import { useVfsStore } from '../store/useVfsStore';
 import { isBoardComponent } from './boardPinMapping';
 import { getInstalledLibraries, installLibrary } from '../services/libraryService';
@@ -56,6 +57,22 @@ export async function loadExample(
   onLibraryProgress?: (progress: LibraryInstallProgress | null) => void,
 ): Promise<void> {
   trackOpenExample(example.title);
+
+  // CRITICAL — clear currentProject FIRST, before touching any other store.
+  //
+  // Otherwise: user has a saved project open (currentProject = { id, slug, …}),
+  // navigates to /examples, clicks an example. We mutate the simulator +
+  // editor stores below; the auto-save hook is still subscribed and still
+  // thinks the active project is the user's saved one. It debounces a
+  // PUT /api/projects/<old-id> with the example's components/wires/files
+  // and OVERWRITES the user's saved project with the example contents.
+  //
+  // The auto-save hook is subscribed to useProjectStore and resets its
+  // baseline (projectId=null, lastSavedHash=null) whenever currentProject?.id
+  // changes. Clearing here BEFORE the mutations below guarantees the hook
+  // sees null as projectId during every subsequent simulator/editor change,
+  // so no PUT goes out.
+  useProjectStore.getState().clearCurrentProject();
 
   // Loading a new example always starts unpaused — otherwise the canvas
   // would open with every LED frozen at the previous example's state.
