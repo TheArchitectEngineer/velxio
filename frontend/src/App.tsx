@@ -10,6 +10,7 @@ import { DocsPage } from './pages/DocsPage';
 // mountPro() and appear under /login, /admin, /:username etc. only when
 // the overlay is loaded.
 import { ExampleDetailPage } from './pages/ExampleDetailPage';
+import { ExampleEditorPage } from './pages/ExampleEditorPage';
 import { ArduinoSimulatorPage } from './pages/ArduinoSimulatorPage';
 import { ArduinoEmulatorPage } from './pages/ArduinoEmulatorPage';
 import { AtmegaSimulatorPage } from './pages/AtmegaSimulatorPage';
@@ -46,7 +47,12 @@ const ROUTES: { path: string; element: ReactElement; index?: boolean }[] = [
   { path: '/', element: <LandingPage />, index: true },
   { path: 'editor', element: <EditorPage /> },
   { path: 'examples', element: <ExamplesPage /> },
+  // /examples/<id> = SEO landing (preview, badges, "Open in Simulator" CTA).
+  // /example/<id>  = live editor with the example pre-loaded; the URL
+  //                  stays pinned so links are shareable + bookmarkable.
+  // Singular vs plural is intentional — Google indexes the plural landings.
   { path: 'examples/:exampleId', element: <ExampleDetailPage /> },
+  { path: 'example/:exampleId', element: <ExampleEditorPage /> },
   { path: 'docs', element: <DocsPage /> },
   { path: 'docs/:section', element: <DocsPage /> },
   // SEO landing pages — keyword-targeted
