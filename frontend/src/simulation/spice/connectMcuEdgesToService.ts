@@ -27,6 +27,7 @@ import {
   useSimulatorStore,
   getBoardPinManager,
 } from '../../store/useSimulatorStore';
+import { useElectricalStore } from '../../store/useElectricalStore';
 import { BOARD_PIN_GROUPS } from './boardPinGroups';
 import type { CircuitSimulationService } from './CircuitSimulationService';
 
@@ -86,6 +87,27 @@ export function connectMcuEdgesToService(service: CircuitSimulationService): () 
     return String(arduinoPin);
   }
 
+  /**
+   * Look up which pin names this board actually wires into the SPICE
+   * netlist.  Reads from `pinNetMap` (populated after each solve) so
+   * we subscribe to ~3-8 pins per board instead of all 64.
+   *
+   * Phase 1d #11: previously we subscribed to every Arduino pin 0..63
+   * "since unused listeners are free" — true for AVR (8 pins) but
+   * spammy for ESP32 (40+ GPIOs × multiple boards = thousands of
+   * dead listeners).  Now scoped to pins the circuit references.
+   */
+  function pinsInCircuit(boardId: string): Set<string> {
+    const { pinNetMap } = useElectricalStore.getState();
+    const pins = new Set<string>();
+    for (const key of pinNetMap.keys()) {
+      const idx = key.indexOf(':');
+      if (idx < 0) continue;
+      if (key.slice(0, idx) === boardId) pins.add(key.slice(idx + 1));
+    }
+    return pins;
+  }
+
   function subscribeBoard(boardId: string, boardKind: string): void {
     const pm = getBoardPinManager(boardId);
     if (!pm) return;
@@ -95,13 +117,16 @@ export function connectMcuEdgesToService(service: CircuitSimulationService): () 
     const pinSubs = new Map<number, () => void>();
     boardSubs.set(boardId, pinSubs);
 
-    // Subscribe to every Arduino pin 0..63 — PinManager only fires
-    // listeners that match real port events, so unused pins are
-    // free.  We cover digital + analog + RP2040/ESP32 GPIO ranges in
-    // one sweep.
+    const wanted = pinsInCircuit(boardId);
+
+    // Sweep 0..63 but only attach a listener when the pin name maps
+    // to one of the wires in the current netlist.  Re-subscription
+    // when the canvas changes happens via `syncBoardSubscriptions` on
+    // store-level board diffs and on `pinNetMap` updates below.
     for (let pin = 0; pin < 64; pin++) {
       const pinName = arduinoPinToName(pin, boardKind);
       if (!pinName) continue;
+      if (wanted.size > 0 && !wanted.has(pinName)) continue;
       const unsub = pm.onPinChange(pin, (_p, state) => {
         schedulePin(boardId, pinName, state, vcc);
       });
@@ -133,8 +158,20 @@ export function connectMcuEdgesToService(service: CircuitSimulationService): () 
     if (state.boards !== prev.boards) syncBoardSubscriptions();
   });
 
+  // Re-subscribe when the pinNetMap changes — a new wire / removed
+  // wire might add or drop pins that need listeners.  Drop ALL subs
+  // and re-create from the new pinNetMap (cheap: a Map clear and
+  // ~10 pm.onPinChange calls).
+  const unsubElectrical = useElectricalStore.subscribe((state, prev) => {
+    if (state.pinNetMap === prev.pinNetMap) return;
+    const boards = useSimulatorStore.getState().boards;
+    for (const id of Array.from(boardSubs.keys())) unsubscribeBoard(id);
+    for (const b of boards) subscribeBoard(b.id, b.boardKind);
+  });
+
   return () => {
     unsubBoards();
+    unsubElectrical();
     for (const pinSubs of boardSubs.values()) {
       for (const unsub of pinSubs.values()) unsub();
     }

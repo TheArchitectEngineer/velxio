@@ -109,6 +109,9 @@ const ADC_PIN_TO_GPIO: Partial<Record<BoardKind, (pinName: string, channel: numb
 export function connectAnalogInputsToMcu(): () => void {
   const patchedAdcs = new WeakSet<object>();
   const qemuWaveformChannels = new Set<string>();
+  // Phase 1d #10 — warn-once set so ADC-clip messages don't spam the
+  // console.  Key is `${boardId}:${pinName}`.
+  const clipWarned = new Set<string>();
   let replayStartMs = 0;
   let replayEpochLatched = false;
 
@@ -171,9 +174,28 @@ export function connectAnalogInputsToMcu(): () => void {
             const samples = net ? timeWaveforms.nodes.get(net) : undefined;
             if (!samples || samples.length === 0) continue;
             const u12 = new Uint16Array(samples.length);
+            // Phase 1d #10 — count clip events to surface ESP32 ADC
+            // range violations once per pin.  If more than 10% of
+            // samples land outside [0, 3.3] V, warn the user; a
+            // rectifier without a clamp is the canonical case.
+            let clipped = 0;
+            let observedMin = Infinity;
+            let observedMax = -Infinity;
             for (let i = 0; i < samples.length; i++) {
-              const v = Math.max(0, Math.min(3.3, samples[i]));
+              const s = samples[i];
+              if (s < observedMin) observedMin = s;
+              if (s > observedMax) observedMax = s;
+              if (s < 0 || s > 3.3) clipped++;
+              const v = Math.max(0, Math.min(3.3, s));
               u12[i] = Math.round((v / 3.3) * 4095);
+            }
+            const clipKey = `${boardId}:${pinName}`;
+            if (clipped > samples.length / 10 && !clipWarned.has(clipKey)) {
+              clipWarned.add(clipKey);
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[adc-clip] ${clipKey}: ${clipped}/${samples.length} samples outside [0, 3.3] V (range ${observedMin.toFixed(2)}…${observedMax.toFixed(2)} V). ESP32 ADC reads will saturate at the rails. Add a divider or clamp if you need the full swing.`,
+              );
             }
             const gpioPin = gpioFn(pinName, channel);
             if (gpioPin < 0) continue;

@@ -81,6 +81,29 @@ export function startSimulation(): () => void {
   const unsubService = service.start();
   const unsubAdc = connectAnalogInputsToMcu();
   const unsubEdges = connectMcuEdgesToService(service);
+
+  // Phase 1d #16 — debug helper. Call `__spiceDebug()` from DevTools
+  // to get a snapshot of the simulation state (analysis mode, voltage
+  // count, pin map, last solve time, etc.).  Useful for diagnosing
+  // "why is my circuit not solving?" reports from users.
+  (window as unknown as { __spiceDebug?: () => void }).__spiceDebug = () => {
+    const electrical = useElectricalStore.getState();
+    // eslint-disable-next-line no-console
+    console.log('[__spiceDebug]', {
+      analysisMode: electrical.analysisMode,
+      converged: electrical.converged,
+      error: electrical.error,
+      lastSolveMs: electrical.lastSolveMs,
+      nodeVoltageCount: Object.keys(electrical.nodeVoltages).length,
+      branchCurrentCount: Object.keys(electrical.branchCurrents).length,
+      pinNetMapSize: electrical.pinNetMap.size,
+      hasTimeWaveforms: !!electrical.timeWaveforms,
+      paused: electrical.paused,
+      sampleVoltages: Object.entries(electrical.nodeVoltages).slice(0, 8),
+      pinNetSample: [...electrical.pinNetMap.entries()].slice(0, 8),
+    });
+  };
+
   return () => {
     unsubService();
     unsubAdc();
