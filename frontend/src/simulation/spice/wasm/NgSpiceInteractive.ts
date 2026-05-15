@@ -159,6 +159,26 @@ export class NgSpiceInteractive {
     return this.request<VecResult>('readVec', { name }, 'vec');
   }
 
+  /**
+   * Enumerate every vector name in the current plot.  Returns
+   * case-preserved names — `ngGet_Vec_Info` lookups are
+   * case-sensitive for source-current vectors like `V_src#branch`.
+   *
+   * The worker reads via `ngSpice_AllVecs(curPlot)` and walks the
+   * NUL-terminated char** array.  Used by `NgSpiceWorkerAdapter` so
+   * the production path doesn't have to heuristic-parse netlist
+   * strings (Phase 1d #6).
+   */
+  async listVectors(): Promise<string[]> {
+    await this.init();
+    const res = await this.request<{ names: string[] }>(
+      'listVectors',
+      {},
+      'vector-list',
+    );
+    return res.names;
+  }
+
   /** Reset the engine to a clean state (drops netlist + plots). */
   async reset(): Promise<void> {
     await this.init();

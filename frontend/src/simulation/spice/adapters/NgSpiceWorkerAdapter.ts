@@ -140,6 +140,48 @@ export class NgSpiceWorkerAdapter implements SolverPort {
     await this.client.alter(name, dcValue);
   }
 
+  /**
+   * Enumerate vector names in the current plot.  Same surface as
+   * `NgSpiceNodeAdapter.listCurrentVectors` so `runNetlist.ts` no
+   * longer has to heuristic-parse netlist strings to guess what to
+   * read.  Phase 1d #6.
+   */
+  async listCurrentVectors(): Promise<string[]> {
+    await this.init();
+    return this.client.listVectors();
+  }
+
+  /**
+   * Read every vector in the current plot after an analysis has
+   * already run.  Critical for `runNetlist`-style consumers that
+   * want every vector — re-running the analysis to read them would
+   * create a NEW plot and invalidate the pointers.
+   */
+  async readAllCurrentVectors(): Promise<{
+    vectors: Map<string, import('../ports/SolverPort').SolveVector>;
+    rawNames: string[];
+  }> {
+    await this.init();
+    const rawNames = await this.client.listVectors();
+    const vectors = new Map<string, import('../ports/SolverPort').SolveVector>();
+    const reads = await Promise.allSettled(
+      rawNames.map(async (name) => {
+        const v = await this.client.readVec(name);
+        return { requested: name, vec: v };
+      }),
+    );
+    for (const r of reads) {
+      if (r.status !== 'fulfilled') continue;
+      const { requested, vec } = r.value;
+      vectors.set(requested.toLowerCase(), {
+        name: requested.toLowerCase(),
+        real: vec.real,
+        imag: vec.imag,
+      });
+    }
+    return { vectors, rawNames };
+  }
+
   dispose(): void {
     this.client.dispose();
     this.initialised = false;

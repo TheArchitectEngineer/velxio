@@ -92,6 +92,16 @@ function legacyNameFor(ngName: string): string {
   return `v(${l})`;
 }
 
+interface AdapterWithRead {
+  readAllCurrentVectors(): Promise<{
+    vectors: Map<string, import('./ports/SolverPort').SolveVector>;
+    rawNames: string[];
+  }> | {
+    vectors: Map<string, import('./ports/SolverPort').SolveVector>;
+    rawNames: string[];
+  };
+}
+
 /**
  * Submit a netlist, run the embedded analysis directive, return
  * cooked results.  The vendored ngspice runs in a Web Worker so this
@@ -102,38 +112,23 @@ export async function runNetlist(netlist: string): Promise<SpiceResult> {
   await adapter.init();
   await adapter.loadCircuit(netlist);
   const analysis = detectAnalysis(netlist);
-  // First-pass solve to populate the plot.  The worker adapter
-  // doesn't yet expose listCurrentVectors, so we fetch every node
-  // voltage + branch current the user might ask for via the
-  // adapter's parallel readVec batching.  For browser-side
-  // circuitVerifier this is fine — the netlists are bounded by what
-  // the canvas can hold (~50 nets, ~10 V-sources).
+  // Single solve — populate the plot, then enumerate + read every
+  // vector via `readAllCurrentVectors` so the pointers stay valid.
+  // (Re-running the analysis to read vectors would create a new
+  // plot and invalidate everything.)
   await adapter.solve(analysis, { vectorsOfInterest: [] });
-  // We can't readAllCurrentVectors from the worker adapter today —
-  // it doesn't have that method. Fall back to requesting common
-  // patterns: every v(...) and i(...) we can guess from the netlist.
-  const guessed = new Set<string>();
-  for (const line of netlist.split('\n')) {
-    // Match V*, I* source declarations.
-    const mV = line.match(/^([Vv][_\w]+)\s+(\S+)\s+(\S+)/);
-    if (mV) {
-      guessed.add(`v(${mV[2]!.toLowerCase()})`);
-      guessed.add(`v(${mV[3]!.toLowerCase()})`);
-      guessed.add(`i(${mV[1]!.toLowerCase()})`);
-    }
-    // Match generic two-terminal cards (R, C, L, D, Q, M).
-    const mGen = line.match(/^[RCLDQMX][_\w]+\s+(\S+)\s+(\S+)/);
-    if (mGen) {
-      guessed.add(`v(${mGen[1]!.toLowerCase()})`);
-      guessed.add(`v(${mGen[2]!.toLowerCase()})`);
-    }
-  }
-  guessed.delete('v(0)'); // ground
-  if (analysis.kind === 'tran') guessed.add('time');
-  if (analysis.kind === 'ac') guessed.add('frequency');
-
-  const requested = Array.from(guessed).map(ngspiceNameFor);
-  const result = await adapter.solve(analysis, { vectorsOfInterest: requested });
+  const all = await (adapter as unknown as AdapterWithRead).readAllCurrentVectors();
+  const result = {
+    analysis,
+    vectors: all.vectors,
+    timeAxis:
+      analysis.kind === 'tran'
+        ? all.vectors.get('time')?.real ?? new Float64Array(0)
+        : new Float64Array(0),
+    solveMs: 0,
+    warnings: [] as string[],
+  };
+  const rawVecs = all.rawNames;
 
   const variableNames = Array.from(result.vectors.keys()).map(legacyNameFor);
   const getVec = (name: string): VectorValue[] => {

@@ -118,6 +118,11 @@ self.addEventListener('message', async (event) => {
 			return;
 		}
 
+		if (data.type === 'listVectors') {
+			handleListVectors(data.requestId);
+			return;
+		}
+
 		throw new Error(`Unknown message type: ${data.type}`);
 	} catch (error) {
 		self.postMessage({
@@ -206,6 +211,28 @@ function handleReadVec(requestId, vectorName) {
 		},
 		transferables,
 	);
+}
+
+/**
+ * Enumerate every vector in the current plot.  Phase 1d #6.
+ * `ngSpice_AllVecs` returns a NULL-terminated char** array; we walk
+ * it until the first 0 pointer and decode each cstring.  Names are
+ * case-preserved — getVecInfo lookups care about case.
+ */
+function handleListVectors(requestId) {
+	const plot = api.curPlot && api.curPlot();
+	const names = [];
+	if (plot) {
+		const arrPtr = api.allVecs(plot);
+		if (arrPtr) {
+			for (let i = 0; i < 4096; i++) {
+				const ptr = HEAPU32[(arrPtr >> 2) + i];
+				if (!ptr) break;
+				names.push(Module.UTF8ToString(ptr));
+			}
+		}
+	}
+	self.postMessage({ type: 'vector-list', requestId, names });
 }
 
 // ── Command-capture machinery (Phase 1a) ────────────────────────────
