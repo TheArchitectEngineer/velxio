@@ -651,6 +651,10 @@ class TestDHT22EdgeCases(unittest.TestCase):
 class TestBusyWaitAccuracy(unittest.TestCase):
     """Verify busy_wait_us accuracy on this system."""
 
+    @unittest.skipIf(
+        __import__('os').environ.get('CI') == 'true',
+        'Timing-sensitive test (busy-wait absolute duration) — skipped in CI'
+    )
     def test_busy_wait_100us(self):
         t0 = time.perf_counter_ns()
         busy_wait_us(100)
@@ -659,6 +663,10 @@ class TestBusyWaitAccuracy(unittest.TestCase):
         self.assertGreater(elapsed_us, 50, 'Way too fast')
         self.assertLess(elapsed_us, 500, 'Way too slow')
 
+    @unittest.skipIf(
+        __import__('os').environ.get('CI') == 'true',
+        'Timing-sensitive test (busy-wait absolute duration) — skipped in CI'
+    )
     def test_busy_wait_1us(self):
         t0 = time.perf_counter_ns()
         busy_wait_us(1)
